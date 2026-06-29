@@ -1,40 +1,533 @@
--- узел: meridian/roblox_utility_hub_v9_STABLE
+-- узел: meridian/roblox_utility_hub_v10_BULLETPROOF
 -- deps: Delta Executor Environment (Roblox Client)
--- параметры: SAFE_LOAD, GETHUI_UI, COMPACT_UI, TEXT_INPUTS, AUTOGRAB, SAFE_AUTOWEB, FLYFLOOR, ESP, OPTIMIZER
+-- параметры: WAIT_FOR_PLAYER, COMPACT_UI, TEXT_INPUTS, AUTOGRAB, SAFE_AUTOWEB, FLYFLOOR, ESP, OPTIMIZER
 
--- [ КРИТИЧЕСКИЙ ФИКС: Ожидание полной загрузки игры перед выполнением ] --
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
-
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 
+-- [ КРИТИЧЕСКИЙ ФИКС 1: Жесткое ожидание локального игрока ]
 local LocalPlayer = Players.LocalPlayer
-local Mouse = LocalPlayer:GetMouse()
+while not LocalPlayer do
+    RunService.RenderStepped:Wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
 local Camera = Workspace.CurrentCamera
 
--- [ КРИТИЧЕСКИЙ ФИКС: Безопасное создание UI через gethui() ] --
+-- [ КРИТИЧЕСКИЙ ФИКС 2: Гарантированная загрузка UI без прав доступа ]
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "PetyaHub_v9"
+ScreenGui.Name = "PetyaHub_v10"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-local uiParent = nil
+local UI_Parent = nil
 pcall(function()
-    uiParent = (gethui and gethui()) or game:GetService("CoreGui")
+    UI_Parent = (gethui and gethui()) or game:GetService("CoreGui")
 end)
-if not uiParent then
-    uiParent = LocalPlayer:WaitForChild("PlayerGui", 5)
+
+if not UI_Parent then
+    UI_Parent = LocalPlayer:WaitForChild("PlayerGui", 10)
 end
-ScreenGui.Parent = uiParent
+ScreenGui.Parent = UI_Parent
 
 -- Глобальная матрица состояний
 local States = {
+    InfJump = false,
+    SpeedBoost = false,
+    SpeedValue = 16,
+    JumpBoost = false,
+    JumpValue = 50,
+    AutoWeb = false,
+    AutoGrab = false,
+    EspPlayers = false,
+    EspLock = false,
+    FlyFloor = false,
+    AutoTp = false,
+    LagerMode = false,
+    Optimizer = false
+}
+
+local OriginalMaterials = {}
+local ESP_Storage = {}
+local ActiveFloor = nil
+local FloorConnection = nil
+
+--------------------------------------------------------------------------------
+-- ВСПОМОГАТЕЛЬНЫЕ СИСТЕМНЫЕ ФУНКЦИИ & МЕХАНИКИ
+--------------------------------------------------------------------------------
+
+-- Безопасный обход античита прыжков через импульс физики
+local LastJump = 0
+UserInputService.JumpRequest:Connect(function()
+    if States.InfJump and tick() - LastJump > 0.15 then
+        local Character = LocalPlayer.Character
+        local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+        
+        if Root and Humanoid then
+            LastJump = tick()
+            Root.Velocity = Vector3.new(Root.Velocity.X, States.JumpBoost and States.JumpValue or 50, Root.Velocity.Z)
+        end
+    end
+end)
+
+-- Исправленный SPEEDBOOST без возвратов (телепортов) назад
+RunService.Heartbeat:Connect(function(dt)
+    local Character = LocalPlayer.Character
+    local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+    
+    if Root and Humanoid and States.SpeedBoost then
+        if Humanoid.MoveDirection.Magnitude > 0 then
+            local SpeedMultiplier = (States.SpeedValue - Humanoid.WalkSpeed)
+            if SpeedMultiplier > 0 then
+                Root.CFrame = Root.CFrame + (Humanoid.MoveDirection * (SpeedMultiplier * dt))
+            end
+        end
+    end
+end)
+
+-- Контур контроля стандартного JumpBoost
+RunService.PostSimulation:Connect(function()
+    local Character = LocalPlayer.Character
+    if Character then
+        local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+        if Humanoid then
+            if States.JumpBoost and not States.InfJump then
+                Humanoid.JumpPower = States.JumpValue
+                Humanoid.UseJumpPower = true
+            elseif not States.JumpBoost and not States.InfJump then
+                Humanoid.JumpPower = 50
+            end
+        end
+    end
+end)
+
+-- Поиск ближайшего игрока для AUTOWEB
+local function GetClosestPlayer()
+    local Target = nil
+    local MinDistance = math.huge
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            local Root = player.Character.HumanoidRootPart
+            local LocalRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if LocalRoot then
+                local Distance = (Root.Position - LocalRoot.Position).Magnitude
+                if Distance < MinDistance and Distance < 600 then
+                    MinDistance = Distance
+                    Target = Root
+                end
+            end
+        end
+    end
+    return Target
+end
+
+-- Безопасный AUTOWEB: Доводка камеры
+task.spawn(function()
+    while true do
+        task.wait(0.01)
+        if States.AutoWeb and LocalPlayer.Character then
+            local Backpack = LocalPlayer:FindFirstChild("Backpack")
+            local Weapon = LocalPlayer.Character:FindFirstChild("Web Slinger") or LocalPlayer.Character:FindFirstChild("WebSlinger")
+            
+            if not Weapon and Backpack then
+                local TargetWeapon = Backpack:FindFirstChild("Web Slinger") or Backpack:FindFirstChild("WebSlinger")
+                if TargetWeapon then TargetWeapon.Parent = LocalPlayer.Character end
+            end
+            
+            if Weapon and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+                local Target = GetClosestPlayer()
+                if Target then
+                    Camera.CFrame = CFrame.new(Camera.CFrame.Position, Target.Position)
+                end
+            end
+        end
+    end
+end)
+
+-- Контур AUTOGRAB (Автоматический сбор Brainrot через ProximityPrompt)
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        if States.AutoGrab and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            local Root = LocalPlayer.Character.HumanoidRootPart
+            for _, desc in ipairs(Workspace:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") then
+                    local ParentPart = desc.Parent
+                    if ParentPart and ParentPart:IsA("BasePart") then
+                        local Distance = (ParentPart.Position - Root.Position).Magnitude
+                        if Distance <= (desc.MaxActivationDistance or 15) then
+                            pcall(function() fireproximityprompt(desc, 1) end)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Контур управления динамической платформой FLYFLOOR (Подъем 2 секунды, без исчезновения)
+local function ManageFlyFloor(enable)
+    if FloorConnection then FloorConnection:Disconnect() FloorConnection = nil end
+    if ActiveFloor then ActiveFloor:Destroy() ActiveFloor = nil end
+
+    if enable then
+        local Character = LocalPlayer.Character
+        local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+        if not Root then return end
+
+        ActiveFloor = Instance.new("Part")
+        ActiveFloor.Size = Vector3.new(6, 0.5, 6)
+        ActiveFloor.Material = Enum.Material.Neon
+        ActiveFloor.Color = Color3.fromRGB(255, 0, 127)
+        ActiveFloor.Anchored = true
+        ActiveFloor.CanCollide = true
+        ActiveFloor.Position = Root.Position - Vector3.new(0, 3.25, 0)
+        ActiveFloor.Parent = Workspace
+
+        local StartTime = tick()
+        local TargetY = ActiveFloor.Position.Y
+        local SpeedY = 9
+
+        FloorConnection = RunService.Heartbeat:Connect(function(dt)
+            local CurrentCharacter = LocalPlayer.Character
+            local CurrentRoot = CurrentCharacter and CurrentCharacter:FindFirstChild("HumanoidRootPart")
+            
+            if ActiveFloor and CurrentRoot then
+                local TimePassed = tick() - StartTime
+                if TimePassed < 2 then
+                    TargetY = TargetY + (SpeedY * dt)
+                end
+                ActiveFloor.Position = Vector3.new(CurrentRoot.Position.X, TargetY, CurrentRoot.Position.Z)
+            else
+                ManageFlyFloor(false)
+            end
+        end)
+    end
+end
+
+-- Безопасный контур AUTOTP (Quantum Cloner + Виртуальный клик по кнопке)
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if States.AutoTp and LocalPlayer.Character then
+            local Backpack = LocalPlayer:FindFirstChild("Backpack")
+            local Cloner = LocalPlayer.Character:FindFirstChild("Quantum Cloner") or LocalPlayer.Character:FindFirstChild("QuantumCloner")
+            
+            if not Cloner and Backpack then
+                Cloner = Backpack:FindFirstChild("Quantum Cloner") or Backpack:FindFirstChild("QuantumCloner")
+                if Cloner then Cloner.Parent = LocalPlayer.Character end
+            end
+            
+            if Cloner then
+                pcall(function()
+                    Cloner:Activate()
+                    local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
+                    if PlayerGui then
+                        for _, gui in ipairs(PlayerGui:GetDescendants()) do
+                            if gui:IsA("TextButton") and (gui.Name:lower():find("clone") or gui.Text:lower():find("change")) then
+                                if getconnections then
+                                    for _, conn in ipairs(getconnections(gui.MouseButton1Click)) do
+                                        conn:Fire()
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+    end
+end)
+
+-- Контур LAGERMODE (Быстрый Equip/Unequip головы медузы без локальных лагов)
+task.spawn(function()
+    while true do
+        if States.LagerMode and LocalPlayer.Character then
+            local Backpack = LocalPlayer:FindFirstChild("Backpack")
+            local Medusa = LocalPlayer.Character:FindFirstChild("Medusa's Head") or LocalPlayer.Character:FindFirstChild("MedusaHead") or (Backpack and (Backpack:FindFirstChild("Medusa's Head") or Backpack:FindFirstChild("MedusaHead")))
+            
+            if Medusa and Backpack then
+                Medusa.Parent = LocalPlayer.Character
+                RunService.Heartbeat:Wait()
+                Medusa.Parent = Backpack
+            end
+        end
+        task.wait(0.02)
+    end
+end)
+
+-- Контур OPTIMIZER (Жесткое повышение FPS)
+local function ToggleOptimizer(enable)
+    if enable then
+        Lighting.GlobalShadows = false
+        for _, fx in ipairs(Lighting:GetChildren()) do
+            if fx:IsA("PostEffect") or fx:IsA("BlurEffect") or fx:IsA("DepthOfFieldEffect") then fx.Enabled = false end
+        end
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                if not OriginalMaterials[obj] then OriginalMaterials[obj] = {obj.Material, obj.Reflectance} end
+                obj.Material = Enum.Material.SmoothPlastic
+                obj.Reflectance = 0
+            elseif obj:IsA("Decal") or obj:IsA("Texture") then
+                if not OriginalMaterials[obj] then OriginalMaterials[obj] = obj.Transparency end
+                obj.Transparency = 1
+            elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
+                obj.Enabled = false
+            end
+        end
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+    else
+        Lighting.GlobalShadows = true
+        for obj, data in pairs(OriginalMaterials) do
+            if obj and obj.Parent then
+                if obj:IsA("BasePart") then obj.Material = data[1] obj.Reflectance = data[2]
+                elseif obj:IsA("Decal") or obj:IsA("Texture") then obj.Transparency = data end
+            end
+        end
+        table.clear(OriginalMaterials)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- МОДУЛЬ ESP (ИГРОКИ & ДИНАМИЧЕСКИЕ ТАЙМЕРЫ БАЗ)
+--------------------------------------------------------------------------------
+
+local function CreateESP(object, text, color, stateKey, isLock)
+    if ESP_Storage[object] and not isLock then return end
+    if ESP_Storage[object] and isLock then
+        pcall(function() ESP_Storage[object][2].TextLabel.Text = text end)
+        return
+    end
+    
+    local Box = Instance.new("Highlight")
+    Box.Adornee = object
+    Box.FillColor = color
+    Box.FillTransparency = 0.6
+    Box.OutlineColor = Color3.fromRGB(255, 255, 255)
+    Box.OutlineTransparency = 0.2
+    Box.Parent = ScreenGui
+    
+    local Billboard = Instance.new("BillboardGui")
+    Billboard.Adornee = object
+    Billboard.Size = UDim2.new(0, 150, 0, 40)
+    Billboard.AlwaysOnTop = true
+    Billboard.StudsOffset = Vector3.new(0, 3, 0)
+    
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(1, 0, 1, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = text
+    Label.TextColor3 = color
+    Label.Font = Enum.Font.Arcade
+    Label.TextSize = 12
+    Label.Parent = Billboard
+    Billboard.Parent = ScreenGui
+    
+    ESP_Storage[object] = {Box, Billboard}
+    
+    task.spawn(function()
+        while object and object.Parent and States[stateKey] do task.wait(0.5) end
+        Box:Destroy()
+        Billboard:Destroy()
+        ESP_Storage[object] = nil
+    end)
+end
+
+local function GrabTimerText(base)
+    for _, desc in ipairs(base:GetDescendants()) do
+        if desc:IsA("TextLabel") and (desc.Text:find(":") or desc.Text:match("%d")) and desc.Visible then
+            return "[LOCK: " .. desc.Text .. "]"
+        end
+    end
+    return "[BASE SECURED]"
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if States.EspPlayers then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    CreateESP(p.Character.HumanoidRootPart, p.Name, Color3.fromRGB(0, 255, 255), "EspPlayers", false)
+                end
+            end
+        end
+        if States.EspLock then
+            for _, obj in ipairs(Workspace:GetDescendants()) do
+                if obj:IsA("BasePart") and (obj.Name:lower():find("lock") or obj.Name:lower():find("zone") or obj.Name:lower():find("base")) then
+                    local text = GrabTimerText(obj)
+                    CreateESP(obj, text, Color3.fromRGB(255, 170, 0), "EspLock", true)
+                end
+            end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ТЕРМИНАЛА (КОМПАКТНЫЙ ПИКСЕЛЬНЫЙ СТИЛЬ)
+--------------------------------------------------------------------------------
+
+local ToggleButton = Instance.new("TextButton")
+local ButtonCorner = Instance.new("UICorner")
+local ButtonStroke = Instance.new("UIStroke")
+
+ToggleButton.Name = "TriggerButton"
+ToggleButton.Parent = ScreenGui
+ToggleButton.Size = UDim2.new(0, 40, 0, 40)
+ToggleButton.Position = UDim2.new(0, 10, 0.5, -20)
+ToggleButton.BackgroundColor3 = Color3.fromRGB(255, 0, 127)
+ToggleButton.Text = "P"
+ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleButton.Font = Enum.Font.Arcade
+ToggleButton.TextSize = 20
+ToggleButton.Active = true
+ToggleButton.Draggable = true
+ButtonCorner.CornerRadius = UDim.new(1, 0)
+ButtonCorner.Parent = ToggleButton
+ButtonStroke.Thickness = 2
+ButtonStroke.Color = Color3.fromRGB(255, 100, 200)
+ButtonStroke.Parent = ToggleButton
+
+local MainMenu = Instance.new("Frame")
+local MenuCorner = Instance.new("UICorner")
+local MenuStroke = Instance.new("UIStroke")
+local HeaderText = Instance.new("TextLabel")
+local Container = Instance.new("ScrollingFrame")
+local UIListLayout = Instance.new("UIListLayout")
+
+MainMenu.Name = "MainMenu"
+MainMenu.Parent = ScreenGui
+MainMenu.Size = UDim2.new(0, 220, 0, 300)
+MainMenu.Position = UDim2.new(0.5, -110, 0.5, -150)
+MainMenu.BackgroundColor3 = Color3.fromRGB(25, 10, 35)
+MainMenu.Visible = false
+MainMenu.Active = true
+MainMenu.Draggable = true
+
+MenuCorner.CornerRadius = UDim.new(0, 0)
+MenuCorner.Parent = MainMenu
+MenuStroke.Thickness = 2
+MenuStroke.Color = Color3.fromRGB(255, 0, 127)
+MenuStroke.Parent = MainMenu
+
+HeaderText.Name = "Header"
+HeaderText.Parent = MainMenu
+HeaderText.Size = UDim2.new(1, 0, 0, 30)
+HeaderText.BackgroundColor3 = Color3.fromRGB(40, 15, 55)
+HeaderText.Text = "@petyahub"
+HeaderText.TextColor3 = Color3.fromRGB(255, 0, 127)
+HeaderText.Font = Enum.Font.Arcade
+HeaderText.TextSize = 14
+
+Container.Name = "Container"
+Container.Parent = MainMenu
+Container.Position = UDim2.new(0, 6, 0, 35)
+Container.Size = UDim2.new(1, -12, 1, -45)
+Container.BackgroundTransparency = 1
+Container.ScrollBarThickness = 3
+Container.CanvasSize = UDim2.new(0, 0, 0, 0)
+Container.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+UIListLayout.Parent = Container
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Padding = UDim.new(0, 5)
+
+--------------------------------------------------------------------------------
+-- КОНСТРУКТОРЫ ЭЛЕМЕНТОВ ВВОДА И КНОПОК
+--------------------------------------------------------------------------------
+
+local function CreateToggleButton(name, layoutOrder, parentContainer, callback)
+    local Frame = Instance.new("Frame")
+    local TextLabel = Instance.new("TextLabel")
+    local Button = Instance.new("TextButton")
+    
+    Frame.Size = UDim2.new(1, 0, 0, 28)
+    Frame.BackgroundTransparency = 1
+    Frame.LayoutOrder = layoutOrder
+    Frame.Parent = parentContainer
+    
+    TextLabel.Size = UDim2.new(0.65, 0, 1, 0)
+    TextLabel.BackgroundTransparency = 1
+    TextLabel.Text = " " .. name
+    TextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    TextLabel.Font = Enum.Font.Arcade
+    TextLabel.TextSize = 11
+    TextLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TextLabel.Parent = Frame
+    
+    Button.Size = UDim2.new(0.3, 0, 0.8, 0)
+    Button.Position = UDim2.new(0.7, 0, 0.1, 0)
+    Button.BackgroundColor3 = Color3.fromRGB(45, 15, 50)
+    Button.Text = "[OFF]"
+    Button.TextColor3 = Color3.fromRGB(150, 150, 150)
+    Button.Font = Enum.Font.Arcade
+    Button.TextSize = 10
+    Button.Parent = Frame
+    
+    local enabled = false
+    Button.MouseButton1Click:Connect(function()
+        enabled = not enabled
+        if enabled then
+            Button.TextColor3 = Color3.fromRGB(255, 0, 127)
+            Button.Text = "[ON]"
+        else
+            Button.TextColor3 = Color3.fromRGB(150, 150, 150)
+            Button.Text = "[OFF]"
+        end
+        callback(enabled)
+    end)
+end
+
+local function CreateTextInput(name, layoutOrder, parentContainer, placeholder, min, max, callback)
+    local Frame = Instance.new("Frame")
+    local TextLabel = Instance.new("TextLabel")
+    local TextBox = Instance.new("TextBox")
+    
+    Frame.Size = UDim2.new(1, 0, 0, 28)
+    Frame.BackgroundTransparency = 1
+    Frame.LayoutOrder = layoutOrder
+    Frame.Parent = parentContainer
+    
+    TextLabel.Size = UDim2.new(0.6, 0, 1, 0)
+    TextLabel.BackgroundTransparency = 1
+    TextLabel.Text = " " .. name
+    TextLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    TextLabel.Font = Enum.Font.Arcade
+    TextLabel.TextSize = 10
+    TextLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TextLabel.Parent = Frame
+    
+    TextBox.Size = UDim2.new(0.35, 0, 0.8, 0)
+    TextBox.Position = UDim2.new(0.65, 0, 0.1, 0)
+    TextBox.BackgroundColor3 = Color3.fromRGB(35, 15, 45)
+    TextBox.Text = tostring(placeholder)
+    TextBox.PlaceholderText = "NUM"
+    TextBox.TextColor3 = Color3.fromRGB(255, 0, 127)
+    TextBox.Font = Enum.Font.Arcade
+    TextBox.TextSize = 10
+    TextBox.ClearTextOnFocus = true
+    TextBox.Parent = Frame
+    
+    TextBox.FocusLost:Connect(function(enterPressed)
+        local value = tonumber(TextBox.Text)
+        if value then
+            value = math.clamp(value, min, max)
+            TextBox.Text = tostring(value)
+            callback(value)
+        else
+            TextBox.Text = tostring(placeholder)
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- КОМПИЛЯЦИЯ УЗЛОВ ИНТЕРФЕЙСА
+---------------------------local States = {
     InfJump = false,
     SpeedBoost = false,
     SpeedValue = 16,
