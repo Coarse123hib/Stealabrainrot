@@ -1,0 +1,421 @@
+-- узел: meridian/roblox_utility_hub_v6
+-- deps: Delta Executor Environment (Roblox Client)
+-- параметры: UI_FONT (Arcade), COMPACT_UI, TEXT_INPUTS, AUTOGRAB, AUTOWEB_REWORK, FLYFLOOR_ENGINE
+
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+local Camera = Workspace.CurrentCamera
+
+-- Инициализация контейнера UI
+local ScreenGui = Instance.new("ScreenGui")
+pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
+if not ScreenGui.Parent then ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+ScreenGui.Name = "PetyaHub_v6"
+ScreenGui.ResetOnSpawn = false
+
+-- Глобальная матрица состояний
+local States = {
+    InfJump = false,
+    SpeedBoost = false,
+    SpeedValue = 16,
+    JumpBoost = false,
+    JumpValue = 50,
+    AutoWeb = false,
+    AutoGrab = false,
+    EspPlayers = false,
+    FlyFloor = false
+}
+
+local ESP_Storage = {}
+local ActiveFloor = nil
+local FloorConnection = nil
+
+--------------------------------------------------------------------------------
+-- ВСПОМОГАТЕЛЬНЫЕ СИСТЕМНЫЕ ФУНКЦИИ & МЕХАНИКИ
+--------------------------------------------------------------------------------
+
+-- Безопасный обход античита прыжков через импульс физики
+local LastJump = 0
+UserInputService.JumpRequest:Connect(function()
+    if States.InfJump and tick() - LastJump > 0.15 then
+        local Character = LocalPlayer.Character
+        local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+        
+        if Root and Humanoid then
+            LastJump = tick()
+            Root.Velocity = Vector3.new(Root.Velocity.X, States.JumpBoost and States.JumpValue or 50, Root.Velocity.Z)
+        end
+    end
+end)
+
+-- Контур контроля SpeedBoost и стандартного JumpBoost
+RunService.PostSimulation:Connect(function()
+    local Character = LocalPlayer.Character
+    if Character then
+        local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+        if Humanoid then
+            if States.SpeedBoost then
+                Humanoid.WalkSpeed = States.SpeedValue
+            end
+            if States.JumpBoost and not States.InfJump then
+                Humanoid.JumpPower = States.JumpValue
+                Humanoid.UseJumpPower = true
+            elseif not States.JumpBoost and not States.InfJump then
+                Humanoid.JumpPower = 50
+            end
+        end
+    end
+end)
+
+-- Поиск ближайшего игрока для AUTOWEB
+local function GetClosestPlayer()
+    local Target = nil
+    local MinDistance = math.huge
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            local Root = player.Character.HumanoidRootPart
+            local Distance = (Root.Position - LocalPlayer.Character.HumanoidRootPart.Position).Magnitude
+            if Distance < MinDistance then
+                MinDistance = Distance
+                Target = Root
+            end
+        end
+    end
+    return Target
+end
+
+-- Контур AUTOWEB (Экипировка + жесткое наведение)
+RunService.RenderStepped:Connect(function()
+    if States.AutoWeb and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local Backpack = LocalPlayer:FindFirstChild("Backpack")
+        local Weapon = LocalPlayer.Character:FindFirstChild("Web Slinger") or LocalPlayer.Character:FindFirstChild("WebSlinger")
+        
+        -- Авто-взятие в руки
+        if not Weapon and Backpack then
+            local TargetWeapon = Backpack:FindFirstChild("Web Slinger") or Backpack:FindFirstChild("WebSlinger")
+            if TargetWeapon then
+                TargetWeapon.Parent = LocalPlayer.Character
+            end
+        end
+        
+        -- Наведение камеры на ближайшую цель
+        local Target = GetClosestPlayer()
+        if Target then
+            Camera.CFrame = CFrame.new(Camera.CFrame.Position, Target.Position)
+        end
+    end
+end)
+
+-- Контур AUTOGRAB (Автоматический сбор Brainrot через ProximityPrompt)
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        if States.AutoGrab and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            local Root = LocalPlayer.Character.HumanoidRootPart
+            for _, desc in ipairs(Workspace:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") then
+                    local ParentPart = desc.Parent
+                    if ParentPart and ParentPart:IsA("BasePart") then
+                        local Distance = (ParentPart.Position - Root.Position).Magnitude
+                        if Distance <= (desc.MaxActivationDistance or 15) then
+                            pcall(function()
+                                fireproximityprompt(desc, 1)
+                            end)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Контур управления динамической платформой FLYFLOOR
+local function ManageFlyFloor(enable)
+    if FloorConnection then 
+        FloorConnection:Disconnect() 
+        FloorConnection = nil 
+    end
+    if ActiveFloor then 
+        ActiveFloor:Destroy() 
+        ActiveFloor = nil 
+    end
+
+    if enable then
+        local Character = LocalPlayer.Character
+        local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+        if not Root then return end
+
+        -- Создание компактной тонкой платформы малинового цвета
+        ActiveFloor = Instance.new("Part")
+        ActiveFloor.Size = Vector3.new(6, 0.5, 6)
+        ActiveFloor.Material = Enum.Material.Neon
+        ActiveFloor.Color = Color3.fromRGB(255, 0, 127)
+        ActiveFloor.Anchored = true
+        ActiveFloor.CanCollide = true
+        ActiveFloor.Position = Root.Position - Vector3.new(0, 3.25, 0)
+        ActiveFloor.Parent = Workspace
+
+        local StartTime = tick()
+        local TargetY = ActiveFloor.Position.Y
+        local SpeedY = 8 -- Скорость подъема платформы (студий в секунду)
+
+        FloorConnection = RunService.Heartbeat:Connect(function(dt)
+            local CurrentCharacter = LocalPlayer.Character
+            local CurrentRoot = CurrentCharacter and CurrentCharacter:FindFirstChild("HumanoidRootPart")
+            
+            if ActiveFloor and CurrentRoot then
+                local TimePassed = tick() - StartTime
+                if TimePassed < 5 then
+                    -- Фаза 1: Подъем вверх в течение 5 секунд + следование по XZ
+                    TargetY = TargetY + (SpeedY * dt)
+                    ActiveFloor.Position = Vector3.new(CurrentRoot.Position.X, TargetY, CurrentRoot.Position.Z)
+                else
+                    -- Фаза 2: Остановка подъема, жесткое удержание высоты и следование по XZ
+                    ActiveFloor.Position = Vector3.new(CurrentRoot.Position.X, TargetY, CurrentRoot.Position.Z)
+                end
+            else
+                ManageFlyFloor(false)
+            end
+        end)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- МОДУЛЬ ESP УЗЛОВ
+--------------------------------------------------------------------------------
+
+local function CreateESP(object, text, color, stateKey)
+    if ESP_Storage[object] then return end
+    
+    local Box = Instance.new("Highlight")
+    Box.Adornee = object
+    Box.FillColor = color
+    Box.FillTransparency = 0.6
+    Box.OutlineColor = Color3.fromRGB(255, 255, 255)
+    Box.OutlineTransparency = 0.2
+    Box.Parent = ScreenGui
+    
+    local Billboard = Instance.new("BillboardGui")
+    Billboard.Adornee = object
+    Billboard.Size = UDim2.new(0, 200, 0, 50)
+    Billboard.AlwaysOnTop = true
+    Billboard.StudsOffset = Vector3.new(0, 3, 0)
+    
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(1, 0, 1, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = text
+    Label.TextColor3 = color
+    Label.Font = Enum.Font.Arcade
+    Label.TextSize = 14
+    Label.Parent = Billboard
+    Billboard.Parent = ScreenGui
+    
+    ESP_Storage[object] = {Box, Billboard}
+    
+    task.spawn(function()
+        while object and object.Parent and States[stateKey] do task.wait(0.5) end
+        Box:Destroy()
+        Billboard:Destroy()
+        ESP_Storage[object] = nil
+    end)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.8)
+        if States.EspPlayers then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    CreateESP(p.Character.HumanoidRootPart, p.Name, Color3.fromRGB(0, 255, 255), "EspPlayers")
+                end
+            end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ТЕРМИНАЛА (КОМПАКТНЫЙ ПИКСЕЛЬНЫЙ СТИЛЬ)
+--------------------------------------------------------------------------------
+
+local ToggleButton = Instance.new("TextButton")
+local ButtonCorner = Instance.new("UICorner")
+local ButtonStroke = Instance.new("UIStroke")
+
+ToggleButton.Name = "TriggerButton"
+ToggleButton.Parent = ScreenGui
+ToggleButton.Size = UDim2.new(0, 45, 0, 45)
+ToggleButton.Position = UDim2.new(0, 15, 0.5, -22)
+ToggleButton.BackgroundColor3 = Color3.fromRGB(255, 0, 127)
+ToggleButton.Text = "P"
+ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleButton.Font = Enum.Font.Arcade
+ToggleButton.TextSize = 22
+ToggleButton.Active = true
+ToggleButton.Draggable = true
+ButtonCorner.CornerRadius = UDim.new(1, 0)
+ButtonCorner.Parent = ToggleButton
+ButtonStroke.Thickness = 2
+ButtonStroke.Color = Color3.fromRGB(255, 100, 200)
+ButtonStroke.Parent = ToggleButton
+
+local MainMenu = Instance.new("Frame")
+local MenuCorner = Instance.new("UICorner")
+local MenuStroke = Instance.new("UIStroke")
+local HeaderText = Instance.new("TextLabel")
+local Container = Instance.new("ScrollingFrame")
+local UIListLayout = Instance.new("UIListLayout")
+
+MainMenu.Name = "MainMenu"
+MainMenu.Parent = ScreenGui
+MainMenu.Size = UDim2.new(0, 240, 0, 320)
+MainMenu.Position = UDim2.new(0.5, -120, 0.5, -160)
+MainMenu.BackgroundColor3 = Color3.fromRGB(25, 10, 35)
+MainMenu.Visible = false
+MainMenu.Active = true
+MainMenu.Draggable = true
+
+MenuCorner.CornerRadius = UDim.new(0, 0)
+MenuCorner.Parent = MainMenu
+MenuStroke.Thickness = 2
+MenuStroke.Color = Color3.fromRGB(255, 0, 127)
+MenuStroke.Parent = MainMenu
+
+HeaderText.Name = "Header"
+HeaderText.Parent = MainMenu
+HeaderText.Size = UDim2.new(1, 0, 0, 35)
+HeaderText.BackgroundColor3 = Color3.fromRGB(40, 15, 55)
+HeaderText.Text = "@petyahub"
+HeaderText.TextColor3 = Color3.fromRGB(255, 0, 127)
+HeaderText.Font = Enum.Font.Arcade
+HeaderText.TextSize = 16
+
+Container.Name = "Container"
+Container.Parent = MainMenu
+Container.Position = UDim2.new(0, 8, 0, 40)
+Container.Size = UDim2.new(1, -16, 1, -50)
+Container.BackgroundTransparency = 1
+Container.ScrollBarThickness = 4
+Container.CanvasSize = UDim2.new(0, 0, 0, 0)
+Container.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+UIListLayout.Parent = Container
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Padding = UDim.new(0, 6)
+
+--------------------------------------------------------------------------------
+-- КОНСТРУКТОРЫ ЭЛЕМЕНТОВ
+--------------------------------------------------------------------------------
+
+local function CreateToggleButton(name, layoutOrder, parentContainer, callback)
+    local Frame = Instance.new("Frame")
+    local TextLabel = Instance.new("TextLabel")
+    local Button = Instance.new("TextButton")
+    
+    Frame.Size = UDim2.new(1, 0, 0, 30)
+    Frame.BackgroundTransparency = 1
+    Frame.LayoutOrder = layoutOrder
+    Frame.Parent = parentContainer
+    
+    TextLabel.Size = UDim2.new(0.65, 0, 1, 0)
+    TextLabel.BackgroundTransparency = 1
+    TextLabel.Text = " " .. name
+    TextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    TextLabel.Font = Enum.Font.Arcade
+    TextLabel.TextSize = 12
+    TextLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TextLabel.Parent = Frame
+    
+    Button.Size = UDim2.new(0.3, 0, 0.8, 0)
+    Button.Position = UDim2.new(0.7, 0, 0.1, 0)
+    Button.BackgroundColor3 = Color3.fromRGB(45, 15, 50)
+    Button.Text = "[OFF]"
+    Button.TextColor3 = Color3.fromRGB(150, 150, 150)
+    Button.Font = Enum.Font.Arcade
+    Button.TextSize = 11
+    Button.Parent = Frame
+    
+    local enabled = false
+    Button.MouseButton1Click:Connect(function()
+        enabled = not enabled
+        if enabled then
+            Button.TextColor3 = Color3.fromRGB(255, 0, 127)
+            Button.Text = "[ON]"
+        else
+            Button.TextColor3 = Color3.fromRGB(150, 150, 150)
+            Button.Text = "[OFF]"
+        end
+        callback(enabled)
+    end)
+end
+
+local function CreateTextInput(name, layoutOrder, parentContainer, placeholder, min, max, callback)
+    local Frame = Instance.new("Frame")
+    local TextLabel = Instance.new("TextLabel")
+    local TextBox = Instance.new("TextBox")
+    
+    Frame.Size = UDim2.new(1, 0, 0, 30)
+    Frame.BackgroundTransparency = 1
+    Frame.LayoutOrder = layoutOrder
+    Frame.Parent = parentContainer
+    
+    TextLabel.Size = UDim2.new(0.6, 0, 1, 0)
+    TextLabel.BackgroundTransparency = 1
+    TextLabel.Text = " " .. name
+    TextLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    TextLabel.Font = Enum.Font.Arcade
+    TextLabel.TextSize = 11
+    TextLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TextLabel.Parent = Frame
+    
+    TextBox.Size = UDim2.new(0.35, 0, 0.8, 0)
+    TextBox.Position = UDim2.new(0.65, 0, 0.1, 0)
+    TextBox.BackgroundColor3 = Color3.fromRGB(35, 15, 45)
+    TextBox.Text = tostring(placeholder)
+    TextBox.PlaceholderText = "NUM"
+    TextBox.TextColor3 = Color3.fromRGB(255, 0, 127)
+    TextBox.Font = Enum.Font.Arcade
+    TextBox.TextSize = 11
+    TextBox.ClearTextOnFocus = true
+    TextBox.Parent = Frame
+    
+    TextBox.FocusLost:Connect(function(enterPressed)
+        local value = tonumber(TextBox.Text)
+        if value then
+            value = math.clamp(value, min, max)
+            TextBox.Text = tostring(value)
+            callback(value)
+        else
+            TextBox.Text = tostring(placeholder)
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- КОМПИЛЯЦИЯ УЗЛОВ
+--------------------------------------------------------------------------------
+
+ToggleButton.MouseButton1Click:Connect(function()
+    MainMenu.Visible = not MainMenu.Visible
+end)
+
+-- Сборка функциональных блоков интерфейса
+CreateToggleButton("INFJUMP", 1, Container, function(s) States.InfJump = s end)
+
+CreateToggleButton("SPEEDBOOST", 2, Container, function(s) States.SpeedBoost = s end)
+CreateTextInput("SPEED VALUE", 3, Container, 16, 16, 186, function(v) States.SpeedValue = v end)
+
+CreateToggleButton("JUMPBOOST", 4, Container, function(s) States.JumpBoost = s end)
+CreateTextInput("JUMP VALUE", 5, Container, 50, 21, 120, function(v) States.JumpValue = v end)
+
+CreateToggleButton("AUTOWEB", 6, Container, function(s) States.AutoWeb = s end)
+CreateToggleButton("AUTOGRAB", 7, Container, function(s) States.AutoGrab = s end)
+CreateToggleButton("FLYFLOOR", 8, Container, function(s) States.FlyFloor = s do ManageFlyFloor(s) end end)
+CreateToggleButton("ESP PLAYERS", 9, Container, function(s) States.EspPlayers = s end)
